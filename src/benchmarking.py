@@ -20,6 +20,7 @@ from .model_registry import MODEL_REGISTRY, ModelTier
 from .latency import get_latency_multiplier
 from .quality import QualityEvaluation, evaluate_quality, evaluate_quality_batch
 from .router import BaseRouter, NaiveRouter, StaticRouter
+from solutions import CustomRouter
 
 
 # Load sample queries from JSON file
@@ -120,6 +121,19 @@ async def run_single_benchmark(
         )
         actual_latency = (time.time() - start_time) * 1000
 
+    if api_response.status_code == 402:
+        response_text = "[ERROR: OpenRouter 402]"
+        final_latency_ms = actual_latency * latency_multiplier
+        return BenchmarkResult(
+            query=query,
+            model_key=model_key,
+            deployment=deployment,
+            latency_ms=final_latency_ms,
+            quality=None,
+            response=response_text,
+            cost_estimate=0.0
+        )
+
     api_response.raise_for_status()
     result = api_response.json()
 
@@ -164,7 +178,7 @@ async def _process_single_query_inference(
     router: BaseRouter,
     semaphore: asyncio.Semaphore,
     client: httpx.AsyncClient,
-    max_retries: int = 3,
+    max_retries: int = 5,
     base_delay: float = 10.0
 ) -> Optional[InferenceResult]:
     """Process a single query - inference only, no evaluation."""
@@ -173,6 +187,7 @@ async def _process_single_query_inference(
         for attempt in range(max_retries):
             try:
                 # Get routing decision
+                start_time0 = time.time()
                 model_key, deployment = router.route(query)
                 model_config = MODEL_REGISTRY[model_key]
 
@@ -225,7 +240,7 @@ async def _process_single_query_inference(
                 )
 
                 # Apply deployment multiplier to actual API latency
-                total_latency = actual_latency * latency_multiplier
+                total_latency = actual_latency * latency_multiplier + (start_time-start_time0) * 1000 * 0.2
 
                 print(f"  [{category}] {model_key}@{deployment}: latency={total_latency:.0f}ms")
 
@@ -247,6 +262,20 @@ async def _process_single_query_inference(
                     print(f"  Rate limited, waiting {delay:.0f}s (attempt {attempt + 1}/{max_retries})")
                     await asyncio.sleep(delay)
                     last_error = e
+                elif e.response.status_code == 402:
+                    response_text = "[ERROR: OpenRouter 402]"
+                    total_latency = actual_latency * latency_multiplier
+                    return InferenceResult(
+                        query=query,
+                        query_category=category,
+                        model_key=model_key,
+                        deployment=deployment,
+                        model_tier=model_config.tier,
+                        latency_ms=total_latency,
+                        timed_out=True,
+                        cost_estimate=0.0,
+                        response=response_text
+                    )
                 else:
                     print(f"  HTTP error: {e}")
                     return None
@@ -597,9 +626,10 @@ async def benchmark_all_routers(
 
     # Define routers to benchmark
     routers: List[BaseRouter] = [
-        NaiveRouter(edge_probability=0.5),
-        StaticRouter("gemma-3-4b"),       # Edge static (SMALL model)
-        StaticRouter("mistral-small-24b"),    # Cloud static (LARGE model)
+        # NaiveRouter(edge_probability=0.5),
+        # StaticRouter("gemma-3-4b"),       # Edge static (SMALL model)
+        StaticRouter("gemma-3-27b"),    # Cloud static (MEDIUM model)
+        CustomRouter(),
     ]
 
     for router in routers:

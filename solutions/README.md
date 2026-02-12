@@ -1,5 +1,60 @@
 # Solutions Folder
 
+## Architecture overview
+```
+                +-----------+                  
+                | __start__ |                  
+                +-----------+                  
+                      *                        
+                      *                        
+                      *                        
+             +-----------------+               
+             | classify_intent |               
+             +-----------------+               
+               **            **                
+             **                **              
+           **                    **            
++---------------+           +---------------+  
+| score_latency |           | score_mission |  
++---------------+           +---------------+  
+               **            **                
+                 **        **                  
+                   **    **                    
+              +---------------+                
+              | make_decision |                
+              +---------------+                
+                      *                        
+                      *                        
+                      *                        
+                 +---------+                   
+                 | __end__ |                   
+                 +---------+                  
+```
+## Prompt design decisions for each step
+Please find in the customer_router.py file.
+
+## Key results (quality, latency, cost vs. baselines)
+Please find in the evaluation.ipynb file.
+
+## Analysis of routing overhead
+Please find in the evaluation.ipynb file.
+
+## Know limitations
+* Prompts can be further optimised by including representative examples and alternative wording, based on the 
+performance on the sampled dataset.
+* Some logic in `make_decsion` can be explained better through functions, because they are deterministic 
+and do not need any reasoning.
+* Confidence score in `classify_intent` is not considered for later stages.
+* In `make_decision`, different LLM's cost and performance can be considered to make a more informed decision.
+* When calculating cost, routing cost is not included.
+* Unit tests and integration tests.
+* RateLimit and NotEnoughCredit errors from OpenRouter, and the output validation errors during batch evaluation make the evaluation results unreliable.
+* Concurrency issues.
+* No learning from historical experiences.
+
+
+__________
+
 This folder is where candidates should implement their routing solution.
 
 ## Structure

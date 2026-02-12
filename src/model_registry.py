@@ -75,13 +75,14 @@ MODEL_REGISTRY: Dict[str, ModelConfig] = {
         cost_per_million_input=0.10,   # Emulated: $0.10 per 1M input tokens
         cost_per_million_output=0.30   # Emulated: $0.30 per 1M output tokens
     ),
-    "mistral-small-24b": ModelConfig(
-        model_id="mistralai/mistral-small-3.1-24b-instruct:free",
-        display_name="Mistral Small 3.1 24B",
-        tier=ModelTier.MEDIUM,
-        cost_per_million_input=0.20,   # Emulated: $0.20 per 1M input tokens
-        cost_per_million_output=0.50   # Emulated: $0.50 per 1M output tokens
-    ),
+    ##  Commenting this model out because it always return RATE LIMIT errors
+    # "mistral-small-24b": ModelConfig(
+    #     model_id="mistralai/mistral-small-3.1-24b-instruct:free",
+    #     display_name="Mistral Small 3.1 24B",
+    #     tier=ModelTier.MEDIUM,
+    #     cost_per_million_input=0.20,   # Emulated: $0.20 per 1M input tokens
+    #     cost_per_million_output=0.50   # Emulated: $0.50 per 1M output tokens
+    # ),
     "gemma-3-27b": ModelConfig(
         model_id="google/gemma-3-27b-it:free",
         display_name="Gemma 3 27B",

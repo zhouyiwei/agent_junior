@@ -53,16 +53,24 @@ CONSTRAINTS
 - Cloud deployment has 1.0x latency multiplier (baseline)
 """
 
-from typing import Optional, List, Tuple, Dict, Any
+from typing import Optional, List, Tuple, Dict, Any, TypedDict
 
 from src.router import BaseRouter
-from src.model_registry import (
-    MODEL_REGISTRY,
-    ModelTier,
-    ModelConfig,
-    EDGE_COMPATIBLE_MODELS,
-    CLOUD_MODELS,
-    get_models_by_tier,
+from src.model_registry import MODEL_REGISTRY, ModelTier
+from langgraph.graph import StateGraph
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage
+from openai import RateLimitError
+import time
+from src.config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL
+
+from .models import (
+    QueryIntent,
+    IntentClassification,
+    LatencyCriticality,
+    MissionCriticality,
+    RoutingDecision,
+    INTENT_DESCRIPTIONS,
 )
 
 
@@ -86,7 +94,8 @@ class CustomRouter(BaseRouter):
 
     def __init__(
         self,
-        # TODO: Add any configuration parameters your router needs
+        routing_model_key: str = "gemma-3-4b",
+        max_retries: int = 3,
     ):
         """
         Initialize the custom router.
@@ -101,8 +110,27 @@ class CustomRouter(BaseRouter):
         """
         super().__init__()
 
-        # TODO: Initialize your router's state here
-        pass
+        if routing_model_key not in MODEL_REGISTRY:
+            raise ValueError(f"Unknown routing model: {routing_model_key}")
+        if MODEL_REGISTRY[routing_model_key].tier != ModelTier.SMALL:
+            raise ValueError("Routing agents must use SMALL tier models")
+
+        self.routing_model_key = routing_model_key
+        self.routing_model_id = MODEL_REGISTRY[routing_model_key].model_id
+
+        if not OPENROUTER_API_KEY:
+            raise ValueError("OPENROUTER_API_KEY environment variable not set")
+
+        self.max_retries = max_retries
+        self._llm = ChatOpenAI(
+            model=self.routing_model_id,
+            api_key=OPENROUTER_API_KEY,
+            base_url=OPENROUTER_BASE_URL,
+            temperature=0.2,
+            max_tokens=500,
+        )
+
+        self.graph = self._build_routing_graph()
 
     @property
     def name(self) -> str:
@@ -117,12 +145,12 @@ class CustomRouter(BaseRouter):
         - "CostOptimized"
         - "AdaptiveQuality"
         """
-        return "Custom"
+        return "AgenticRouting"
 
     def route(
         self,
         query: str,
-        available_models: Optional[List[str]] = None
+        available_models: Optional[List[str]] = None,
     ) -> Tuple[str, str]:
         """
         Route a query to a model and deployment.
@@ -145,7 +173,92 @@ class CustomRouter(BaseRouter):
         - If you return an invalid combination, the benchmark will fail
         """
         self.call_count += 1
-        pass
+
+        result = self.graph.invoke({"query": query, "available_models": available_models})
+        decision = result["routing_decision"]
+        self.routing_history.append((query, decision.model_key, decision.deployment))
+        return (decision.model_key, decision.deployment)
+
+    # =========================================================================
+    # LLM-POWERED PIPELINE STEPS (Task 2)
+    # =========================================================================
+
+    def classify_intent(self, query: str) -> IntentClassification:
+        """Step 1: Intent classification."""
+        return self._invoke_structured(
+            system_prompt=_INTENT_SYSTEM_PROMPT,
+            user_prompt=_format_intent_prompt(query),
+            output_type=IntentClassification,
+        )
+
+    def score_mission(
+        self,
+        query: str,
+        intent: IntentClassification,
+    ) -> MissionCriticality:
+        """Step 2: Mission-criticality scoring."""
+        return self._invoke_structured(
+            system_prompt=_MISSION_SYSTEM_PROMPT,
+            user_prompt=_format_mission_prompt(query, intent),
+            output_type=MissionCriticality,
+        )
+
+    def score_latency(
+        self,
+        query: str,
+        intent: IntentClassification,
+    ) -> LatencyCriticality:
+        """Step 3: Latency-criticality scoring."""
+        return self._invoke_structured(
+            system_prompt=_LATENCY_SYSTEM_PROMPT,
+            user_prompt=_format_latency_prompt(query, intent),
+            output_type=LatencyCriticality,
+        )
+
+    def make_decision(
+        self,
+        query: str,
+        intent: IntentClassification,
+        mission: MissionCriticality,
+        latency: LatencyCriticality,
+        available_models: Optional[List[str]] = None,
+    ) -> RoutingDecision:
+        """Step 4: Final routing decision."""
+        allowed_models = available_models or list(MODEL_REGISTRY.keys())
+        decision = self._invoke_structured(
+            system_prompt=_DECISION_SYSTEM_PROMPT,
+            user_prompt=_format_decision_prompt(
+                query=query,
+                intent=intent,
+                mission=mission,
+                latency=latency,
+                allowed_models=allowed_models,
+            ),
+            output_type=RoutingDecision,
+        )
+        error = self._if_error_in_decision(decision, allowed_models)
+        if not error:
+            return decision
+
+        retry_prompt = (
+            _format_decision_prompt(
+                query=query,
+                intent=intent,
+                mission=mission,
+                latency=latency,
+                allowed_models=allowed_models,
+            )
+            + f"\nPrevious error: {error}\nFix the decision."
+        )
+        retry_decision = self._invoke_structured(
+            system_prompt=_DECISION_SYSTEM_PROMPT,
+            user_prompt=retry_prompt,
+            output_type=RoutingDecision,
+        )
+        if not self._if_error_in_decision(retry_decision, allowed_models):
+            return retry_decision
+        return retry_decision
+
 
     # =========================================================================
     # OPTIONAL HELPER METHODS
@@ -197,14 +310,124 @@ class CustomRouter(BaseRouter):
         """
         # TODO: Implement complexity estimation
         # Example rule-based approach:
-        # if len(query.split()) < 10:
-        #     return "simple"
-        # elif any(kw in query.lower() for kw in ["explain", "analyze", "compare"]):
-        #     return "complex"
-        # else:
-        #     return "moderate"
+        return "moderate"
 
-        pass
+    # =========================================================================
+    # INTERNAL HELPERS
+    # =========================================================================
+
+    def _invoke_structured(self, system_prompt: str, user_prompt: str, output_type):
+        schema = output_type.model_json_schema()
+        fields = ", ".join(schema.get("properties", {}).keys())
+        merged_prompt = f"""{_BASE_SYSTEM_PROMPT}
+{system_prompt}
+
+{user_prompt}
+
+Return ONLY valid JSON with fields: {fields}.
+Do not return the schema. Return an instance object.
+"""
+        messages = [HumanMessage(content=merged_prompt)]
+        llm = self._llm
+        last_error = None
+        for attempt in range(self.max_retries):
+            try:
+                result = llm.invoke(messages)
+                return _parse_json_response(getattr(result, "content", str(result)), output_type)
+            except Exception as exc:
+                last_error = exc
+                if _is_rate_limit_error(exc):
+                    time.sleep(5 * (attempt + 1))
+                    continue
+                else:
+                    retry_prompt = (
+                        f"{merged_prompt}\n\nPrevious error: {last_error}\n"
+                        "Fix the output to satisfy the schema."
+                    )
+                    retry_result = llm.invoke([HumanMessage(content=retry_prompt)])
+                    return _parse_json_response(
+                        getattr(retry_result, "content", str(retry_result)), output_type
+                    )
+        raise RuntimeError(f"_invoke_structured failed after {self.max_retries} retries: {last_error}")
+
+
+
+    @staticmethod
+    def _if_error_in_decision(
+        decision: RoutingDecision,
+        allowed_models: List[str],
+    ):
+        if not decision:
+            return "You must select one model from the allowed_models list."
+        model_key = decision.model_key
+        deployment = decision.deployment
+        model_tier = decision.model_tier
+
+        if model_key not in allowed_models:
+            return "model_key is not from the allowed_models list."
+        if deployment not in ("edge", "cloud"):
+            return "deployment is neither edge or cloud."
+        model_config = MODEL_REGISTRY.get(decision.model_key)
+        if not model_config:
+            return "model_key not found in model registry."
+        if decision.deployment == "edge" and model_config.tier != ModelTier.SMALL:
+            return "Only SMALL tier models can be deployed on edge."
+        if decision.deployment == "cloud" and model_config.tier == ModelTier.SMALL:
+            return "Small tier models have to be deployed on EDGE."
+        if model_tier != model_config.tier.value:
+            return ("Your selected model does not match to your selected model_tier. "
+                    "Make a different model selection based on your model tier.")
+        return None
+
+    # =========================================================================
+    # GRAPH (Task 3)
+    # =========================================================================
+    class RouterState(TypedDict, total=False):
+        query: str
+        available_models: Optional[List[str]]
+        intent: IntentClassification
+        mission_criticality: MissionCriticality
+        latency_criticality: LatencyCriticality
+        routing_decision: RoutingDecision
+
+    def _build_routing_graph(self):
+        graph = StateGraph(CustomRouter.RouterState)
+
+        def classify_intent_node(state: CustomRouter.RouterState) -> Dict[str, Any]:
+            intent = self.classify_intent(state["query"])
+            return {"intent": intent}
+
+        def score_mission_node(state: CustomRouter.RouterState) -> Dict[str, Any]:
+            mission = self.score_mission(state["query"], state["intent"])
+            return {"mission_criticality": mission}
+
+        def score_latency_node(state: CustomRouter.RouterState) -> Dict[str, Any]:
+            latency = self.score_latency(state["query"], state["intent"])
+            return {"latency_criticality": latency}
+
+        def make_decision_node(state: CustomRouter.RouterState) -> Dict[str, Any]:
+            decision = self.make_decision(
+                query=state["query"],
+                intent=state["intent"],
+                mission=state["mission_criticality"],
+                latency=state["latency_criticality"],
+                available_models=state.get("available_models"),
+            )
+            return {"routing_decision": decision}
+
+        graph.add_node("classify_intent", classify_intent_node)
+        graph.add_node("score_mission", score_mission_node)
+        graph.add_node("score_latency", score_latency_node)
+        graph.add_node("make_decision", make_decision_node)
+
+        graph.set_entry_point("classify_intent")
+        graph.add_edge("classify_intent", "score_mission")
+        graph.add_edge("classify_intent", "score_latency")
+        graph.add_edge("score_mission", "make_decision")
+        graph.add_edge("score_latency", "make_decision")
+
+        return graph.compile()
+
 
     def _classify_intent(self, query: str) -> str:
         """
@@ -339,6 +562,164 @@ class CustomRouter(BaseRouter):
         # self.model_performance_cache[key]["latency"].append(latency_ms)
 
         pass
+
+
+# =============================================================================
+# PROMPTS
+# =============================================================================
+
+_BASE_SYSTEM_PROMPT = """You are a routing assistant."""
+
+_INTENT_SYSTEM_PROMPT = """Given a query, classify its intent.
+Consider:
+- What kind of task the query requires?
+"""
+
+_MISSION_SYSTEM_PROMPT = """Score how critical it is to get a correct answer.
+Consider:
+- Is the user making a decision based on this?
+- Could a wrong answer cause harm?
+- Is this a factual question with a definitive answer?
+- Is this casual/exploratory?
+> 0.7 for high stakes queries, < 0.3 for low stakes queries
+"""
+
+_LATENCY_SYSTEM_PROMPT = """Given a query and its intent, score how time-sensitive the response is. 
+Consider:
+- Is this a quick lookup or a deep analysis?
+- Would the user expect an instant response?
+- Is latency more important than thoroughness?
+> 0.7 for latency-critical queries, < 0.3 for queries that do not need a quick response
+"""
+
+_DECISION_SYSTEM_PROMPT = """Given the intent, mission score, and speed score, select the best (model_key, model_tier, deployment)
+combination from the model registry.
+
+You MUST apply exactly ONE routing rule below, in order, based only on the score bands:
+1) high mission + low speed demand -> LARGE or REASONING tier, deployment = cloud
+2) low mission + high speed demand -> SMALL tier, deployment = edge
+3) high mission + high speed demand -> MEDIUM tier, deployment = cloud
+4) low mission + low speed demand -> SMALL tier, deployment = edge
+5) otherwise -> MEDIUM tier, deployment = cloud
+
+Do NOT invent new rules. Do NOT contradict the rules. You MUST choose a model whose tier matches the rule’s tier.
+A score is high if > 0.7, a score is low if < 0.3.
+
+Selection procedure (follow exactly):
+1) Determine if the mission and speed demand scores are high or low.
+2) Determine the tier from the rule.
+3) Filter Allowed Models to that tier only.
+4) From that filtered list, select a model that is most like to have good quality and low cost.
+
+Reasoning MUST include:
+- Rule number used
+- Tier required by the rule
+- The chosen model’s tier (as shown in the Allowed Models list)
+- A one-line confirmation that the tier matches the rule
+"""
+
+
+def _format_intent_prompt(query: str) -> str:
+    intent_values = ", ".join([e.value for e in QueryIntent])
+    intent_desc = " ".join(
+        [f"{k.value}: {v}" for k, v in INTENT_DESCRIPTIONS.items()]
+    )
+    return f"""{intent_desc}
+
+Use only these intent values:
+{intent_values}.
+
+Query:
+{query}
+"""
+
+
+def _format_mission_prompt(query: str, intent: IntentClassification) -> str:
+    intent_desc = INTENT_DESCRIPTIONS.get(intent.intent, intent.intent.value)
+    return f"""Use a numeric score between 0.0 and 1.0. The higher the score is, the more critical it is to be correct.
+Consider the query intent when scoring.
+
+Query:
+{query}
+
+Intent:
+{intent.intent}
+
+Intent description:
+{intent_desc}
+"""
+
+
+def _format_latency_prompt(query: str, intent: IntentClassification) -> str:
+    intent_desc = INTENT_DESCRIPTIONS.get(intent.intent, intent.intent.value)
+    return f"""Use a numeric score between 0.0 and 1.0. The higher the score is, the more quickly the customer needs 
+    a response.
+Consider the query intent when scoring.
+
+Query:
+{query}
+
+Intent:
+{intent.intent}
+
+Intent description:
+{intent_desc}
+"""
+
+
+def _format_decision_prompt(
+    query: str,
+    intent: IntentClassification,
+    mission: MissionCriticality,
+    latency: LatencyCriticality,
+    allowed_models: List[str],
+) -> str:
+    tier_groups = {t: [] for t in ModelTier}
+    allowed_set = set(allowed_models)
+    for key, config in MODEL_REGISTRY.items():
+        if key not in allowed_set:
+            continue
+        tier_groups[config.tier].append(key)
+    tier_lines = []
+    for tier in ModelTier:
+        keys = tier_groups[tier]
+        if keys:
+            tier_lines.append(f"- {tier.value.upper()}: {', '.join(keys)}")
+    tier_list_str = "\n".join(tier_lines) if tier_lines else "(none)"
+    intent_desc = INTENT_DESCRIPTIONS.get(intent.intent, intent.intent.value)
+    return f"""Choose only from the allowed models listed below.
+
+Query:
+{query}
+
+Intent: {intent.intent}
+Intent description: {intent_desc}
+Mission score: {mission.score}
+Speed demand score: {latency.score}
+
+Allowed models grouped by tier (you MUST choose from the tier implied by the rule):
+{tier_list_str}
+
+Selection rule reminder:
+- Determine the tier from the routing rule.
+- Choose ONLY from that tier's list above.
+"""
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    if isinstance(exc, RateLimitError):
+        return True
+    message = str(exc).lower()
+    return "rate limit" in message or "429" in message
+
+
+def _parse_json_response(text: str, model_cls):
+    cleaned = text.strip()
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        cleaned = cleaned[start:end + 1]
+    return model_cls.model_validate_json(cleaned)
 
 
 # =============================================================================

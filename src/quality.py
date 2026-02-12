@@ -14,7 +14,7 @@ LIMITATIONS (candidates should ignore these):
 
 from typing import Dict, List
 from pydantic import BaseModel, Field
-from pydantic_ai import Agent, ModelRetry, RunContext
+from pydantic_ai import Agent, ModelRetry, RunContext, PromptedOutput
 from dataclasses import dataclass
 
 from .model_registry import MODEL_REGISTRY
@@ -90,7 +90,11 @@ EVALUATOR_SYSTEM_PROMPT = """You are a strict expert evaluator assessing AI assi
 - DO NOT default to high scores. Most responses are 5-8, not 9-10.
 - A "correct but shallow" answer is 5-6, not 8-9.
 - Deduct points for: verbosity, missing edge cases, lack of examples when helpful, generic advice.
-- Perfect 10s should be rare - the response must be genuinely exceptional."""
+- Perfect 10s should be rare - the response must be genuinely exceptional.
+- Return ONLY valid JSON matching the schema. Do NOT use code fences. Do NOT include extra text.
+
+Example JSON output:
+{"overall_score":7,"dimensions":[{"dimension":"accuracy","score":7,"reasoning":"Mostly correct with minor gaps."},{"dimension":"relevance","score":8,"reasoning":"Addresses the query directly."},{"dimension":"completeness","score":6,"reasoning":"Missing some important details."},{"dimension":"clarity","score":7,"reasoning":"Clear but could be more structured."},{"dimension":"helpfulness","score":7,"reasoning":"Useful but could be more specific."}],"summary":"A solid response with minor omissions and room for clearer structure."}"""
 
 
 def create_evaluator_agent(
@@ -107,8 +111,8 @@ def create_evaluator_agent(
     return Agent(
         model=model_string,
         system_prompt=EVALUATOR_SYSTEM_PROMPT,
-        output_type=QualityEvaluationResult,
-        retries=3
+        output_type=PromptedOutput(QualityEvaluationResult),
+        retries=5
     )
 
 
@@ -187,9 +191,9 @@ def create_batch_evaluator_agent(
     agent = Agent(
         model=model_string,
         system_prompt=EVALUATOR_SYSTEM_PROMPT,
-        output_type=BatchQualityEvaluationResult,
+        output_type=PromptedOutput(BatchQualityEvaluationResult),
         deps_type=BatchEvalDeps,
-        retries=3
+        retries=5
     )
 
     @agent.output_validator
@@ -225,19 +229,46 @@ async def _evaluate_batch_chunk(
     agent = create_batch_evaluator_agent(evaluator_model)
     deps = BatchEvalDeps(expected_count=len(items))
 
-    result = await agent.run(user_prompt, deps=deps)
+    try:
+        result = await agent.run(user_prompt, deps=deps)
 
-    # Map to QualityEvaluation with model_used metadata
-    return [
-        QualityEvaluation(
-            overall_score=e.overall_score,
-            dimensions=e.dimensions,
-            summary=e.summary,
-            model_used=items[i][2],  # model_key from input tuple
-            evaluator_model=evaluator_model
-        )
-        for i, e in enumerate(result.output.evaluations)
-    ]
+        # Map to QualityEvaluation with model_used metadata
+        return [
+            QualityEvaluation(
+                overall_score=e.overall_score,
+                dimensions=e.dimensions,
+                summary=e.summary,
+                model_used=items[i][2],  # model_key from input tuple
+                evaluator_model=evaluator_model
+            )
+            for i, e in enumerate(result.output.evaluations)
+        ]
+    except Exception as exc:
+        print(f"    Batch evaluation failed: {exc}")
+        # Fallback: evaluate items one by one
+        results: List[QualityEvaluation] = []
+        for query, response, model_key in items:
+            try:
+                results.append(
+                    await evaluate_quality(
+                        query=query,
+                        response=response,
+                        model_key=model_key,
+                        evaluator_model=evaluator_model,
+                    )
+                )
+            except Exception as inner_exc:
+                print(f"    Single evaluation failed: {inner_exc}")
+                results.append(
+                    QualityEvaluation(
+                        overall_score=0.0,
+                        dimensions=[],
+                        summary="Evaluation failed.",
+                        model_used=model_key,
+                        evaluator_model=evaluator_model,
+                    )
+                )
+        return results
 
 
 async def evaluate_quality_batch(

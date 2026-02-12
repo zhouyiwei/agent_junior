@@ -50,18 +50,6 @@ from .router import (
     Router,
 )
 
-# Benchmarking
-from .benchmarking import (
-    BenchmarkResult,
-    RoutingBenchmarkResult,
-    run_single_benchmark,
-    benchmark_router,
-    benchmark_all_routers,
-    print_benchmark_summary,
-    print_router_comparison,
-    SAMPLE_QUERIES,
-)
-
 __all__ = [
     # Configuration
     "OPENROUTER_API_KEY",
@@ -93,7 +81,7 @@ __all__ = [
     "NaiveRouter",
     "StaticRouter",
     "Router",
-    # Benchmarking
+    # Benchmarking (lazy)
     "BenchmarkResult",
     "RoutingBenchmarkResult",
     "run_single_benchmark",
@@ -103,3 +91,20 @@ __all__ = [
     "print_router_comparison",
     "SAMPLE_QUERIES",
 ]
+
+
+def __getattr__(name: str):
+    if name in {
+        "BenchmarkResult",
+        "RoutingBenchmarkResult",
+        "run_single_benchmark",
+        "benchmark_router",
+        "benchmark_all_routers",
+        "print_benchmark_summary",
+        "print_router_comparison",
+        "SAMPLE_QUERIES",
+    }:
+        from . import benchmarking as _benchmarking
+
+        return getattr(_benchmarking, name)
+    raise AttributeError(f"module 'src' has no attribute {name!r}")
